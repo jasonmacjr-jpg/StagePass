@@ -394,6 +394,7 @@ input, select, textarea { font-family: inherit; border: none; outline: none; bac
 .flow-step-line { width: 24px; height: 2px; background: var(--border-medium); border-radius: 1px; }
 .flow-step.completed + .flow-step-line, .flow-step-line.completed { background: var(--sp-success); }
 </style>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 <body>
 
@@ -458,7 +459,7 @@ input, select, textarea { font-family: inherit; border: none; outline: none; bac
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
             Artist Dashboard
           </div>
-          <div class="dropdown-item" onclick="navigateTo('admin');closeAllDropdowns()">
+          <div class="dropdown-item hidden" id="adminNavItem" onclick="navigateTo('admin');closeAllDropdowns()">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
             Admin Dashboard
           </div>
@@ -1028,6 +1029,237 @@ input, select, textarea { font-family: inherit; border: none; outline: none; bac
 </nav>
 
 <script>
+// ==================== CONFIG ====================
+const API_BASE_URL = window.location.hostname === 'localhost' 
+  ? 'http://localhost:3000/api' 
+  : 'https://your-stagepass-api.com/api';
+
+// ==================== API CLIENT ====================
+const api = {
+  async request(endpoint, options = {}) {
+    const url = `${API_BASE_URL}${endpoint}`;
+    const token = localStorage.getItem('sp_token');
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(token && { 'Authorization': `Bearer ${token}` }),
+      ...options.headers
+    };
+    try {
+      const res = await fetch(url, { ...options, headers });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        const err = new Error(data?.message || `HTTP ${res.status}`);
+        err.status = res.status;
+        err.data = data;
+        throw err;
+      }
+      return data;
+    } catch (err) {
+      console.error(`API Error [${endpoint}]:`, err);
+      throw err;
+    }
+  },
+  get(endpoint) { return this.request(endpoint, { method: 'GET' }); },
+  post(endpoint, body) { return this.request(endpoint, { method: 'POST', body: JSON.stringify(body) }); },
+  put(endpoint, body) { return this.request(endpoint, { method: 'PUT', body: JSON.stringify(body) }); },
+  patch(endpoint, body) { return this.request(endpoint, { method: 'PATCH', body: JSON.stringify(body) }); },
+  delete(endpoint) { return this.request(endpoint, { method: 'DELETE' }); }
+};
+
+// ==================== SOCKET CLIENT ====================
+let socket = null;
+function initSocket() {
+  const token = localStorage.getItem('sp_token');
+  if (!token) return;
+  const socketUrl = API_BASE_URL.replace('/api', '');
+  socket = io(socketUrl, { auth: { token }, transports: ['websocket', 'polling'] });
+  socket.on('connect', () => console.log('Socket connected:', socket.id));
+  socket.on('disconnect', () => console.log('Socket disconnected'));
+  socket.on('notification', (data) => showToast(data.message, data.type || 'info'));
+  socket.on('booking_update', (data) => {
+    showToast(`Booking update: ${data.message}`, 'info');
+    if (document.getElementById('page-dashboard').classList.contains('active')) loadDashboardData();
+  });
+  socket.on('message', (data) => {
+    if (document.getElementById('page-messages').classList.contains('active')) appendMessage(data);
+    else showToast(`New message from ${data.sender}`, 'info');
+  });
+}
+function disconnectSocket() { if (socket) { socket.disconnect(); socket = null; } }
+
+// ==================== AUTH STATE ====================
+let currentUser = null;
+
+async function checkAuth() {
+  const token = localStorage.getItem('sp_token');
+  if (!token) { setLoggedOutUI(); return false; }
+  try {
+    const user = await api.get('/auth/me');
+    currentUser = user;
+    setLoggedInUI(user);
+    initSocket();
+    return true;
+  } catch (err) {
+    if (err.status === 401) { localStorage.removeItem('sp_token'); localStorage.removeItem('sp_user'); }
+    setLoggedOutUI();
+    return false;
+  }
+}
+
+function setLoggedInUI(user) {
+  isLoggedIn = true;
+  const signInBtn = document.querySelector('.btn-primary.btn-sm[onclick="openAuthModal()"]');
+  const userMenu = document.getElementById('userMenuDropdown');
+  const userNameSpan = userMenu?.querySelector('span');
+  if (signInBtn) signInBtn.classList.add('hidden');
+  if (userMenu) userMenu.classList.remove('hidden');
+  if (userNameSpan && user?.name) userNameSpan.textContent = user.name.split(' ')[0] || user.name;
+  // Show admin link ONLY for admin users
+  const adminNav = document.getElementById('adminNavItem');
+  if (adminNav) {
+    if (user?.role === 'admin') adminNav.classList.remove('hidden');
+    else adminNav.classList.add('hidden');
+  }
+}
+
+function setLoggedOutUI() {
+  isLoggedIn = false;
+  currentUser = null;
+  const signInBtn = document.querySelector('.btn-primary.btn-sm[onclick="openAuthModal()"]');
+  const userMenu = document.getElementById('userMenuDropdown');
+  if (signInBtn) signInBtn.classList.remove('hidden');
+  if (userMenu) userMenu.classList.add('hidden');
+  const adminNav = document.getElementById('adminNavItem');
+  if (adminNav) adminNav.classList.add('hidden');
+  disconnectSocket();
+}
+
+// ==================== AUTH HANDLERS (BACKEND CONNECTED) ====================
+async function handleSignIn() {
+  const form = document.getElementById('signinForm');
+  const email = form.querySelector('input[type="email"]').value.trim();
+  const password = form.querySelector('input[type="password"]').value;
+  if (!email || !password) { showToast('Please fill in all fields', 'error'); return; }
+  try {
+    const data = await api.post('/auth/login', { email, password });
+    localStorage.setItem('sp_token', data.token);
+    localStorage.setItem('sp_user', JSON.stringify(data.user));
+    currentUser = data.user;
+    closeAuthModal();
+    setLoggedInUI(data.user);
+    initSocket();
+    showToast(`Welcome back, ${data.user.name || data.user.email}!`, 'success');
+    form.querySelector('input[type="email"]').value = '';
+    form.querySelector('input[type="password"]').value = '';
+  } catch (err) {
+    showToast(err.message || 'Invalid email or password', 'error');
+  }
+}
+
+async function handleSignUp() {
+  const form = document.getElementById('signupForm');
+  const name = form.querySelector('input[type="text"]').value.trim();
+  const email = form.querySelector('input[type="email"]').value.trim();
+  const password = form.querySelector('input[type="password"]').value;
+  const accountType = form.querySelector('select').value;
+  if (!name || !email || !password) { showToast('Please fill in all fields', 'error'); return; }
+  if (password.length < 6) { showToast('Password must be at least 6 characters', 'error'); return; }
+  try {
+    const data = await api.post('/auth/register', { name, email, password, role: accountType === 'Artist' ? 'artist' : 'customer' });
+    localStorage.setItem('sp_token', data.token);
+    localStorage.setItem('sp_user', JSON.stringify(data.user));
+    currentUser = data.user;
+    closeAuthModal();
+    setLoggedInUI(data.user);
+    initSocket();
+    showToast('Account created successfully!', 'success');
+    form.querySelectorAll('input').forEach(i => i.value = '');
+  } catch (err) {
+    showToast(err.message || 'Registration failed', 'error');
+  }
+}
+
+function handleSignOut() {
+  localStorage.removeItem('sp_token');
+  localStorage.removeItem('sp_user');
+  currentUser = null;
+  setLoggedOutUI();
+  showToast('Signed out successfully', 'info');
+  navigateTo('home');
+}
+
+// ==================== DATA LOADING FROM API ====================
+async function loadArtistsFromAPI() {
+  try {
+    const data = await api.get('/artists');
+    if (data && data.length) {
+      window.artistsFromAPI = data;
+      // You can replace the artists array here if you want live data
+      // artists = data; // Uncomment when your API returns the same shape
+    }
+  } catch (err) { console.log('Using fallback artist data'); }
+}
+
+async function loadEventsFromAPI() {
+  try {
+    const data = await api.get('/events');
+    if (data && data.length) {
+      window.eventsFromAPI = data;
+      // events = data; // Uncomment when your API returns the same shape
+    }
+  } catch (err) { console.log('Using fallback event data'); }
+}
+
+async function loadDashboardData() {
+  if (!currentUser) return;
+  try {
+    const [bookings, tickets, stats] = await Promise.all([
+      api.get('/bookings/my').catch(() => []),
+      api.get('/tickets/my').catch(() => []),
+      api.get('/users/stats').catch(() => null)
+    ]);
+    console.log('Dashboard data loaded', { bookings, tickets, stats });
+  } catch (err) { console.log('Dashboard data load failed, using fallback'); }
+}
+
+// ==================== BOOKING API HELPERS ====================
+async function submitBookingRequest(artistId, bookingData) {
+  try {
+    const data = await api.post('/bookings', { artistId, ...bookingData });
+    showToast('Booking request submitted!', 'success');
+    if (socket) socket.emit('booking_created', data);
+    return data;
+  } catch (err) {
+    showToast(err.message || 'Failed to submit booking', 'error');
+    throw err;
+  }
+}
+
+async function submitPaymentProof(bookingId, proofData) {
+  try {
+    const data = await api.post(`/bookings/${bookingId}/payment`, proofData);
+    showToast('Payment proof submitted! Awaiting verification.', 'success');
+    return data;
+  } catch (err) {
+    showToast(err.message || 'Payment submission failed', 'error');
+    throw err;
+  }
+}
+
+// ==================== MESSAGES API ====================
+async function loadConversations() { try { return await api.get('/messages/conversations'); } catch { return []; } }
+async function loadMessages(convId) { try { return await api.get(`/messages/${convId}`); } catch { return []; } }
+async function sendMessage(convId, text) {
+  try {
+    const data = await api.post(`/messages/${convId}`, { text });
+    if (socket) socket.emit('send_message', { conversationId: convId, text });
+    return data;
+  } catch (err) { showToast('Failed to send message', 'error'); throw err; }
+}
+function appendMessage(msg) { console.log('New message:', msg); }
+
+// ==================== EXISTING DATA (UNCHANGED) ====================
+
 // ==================== DATA ====================
 const artists = [
   { id:1, name:"Marcus Chen", category:"DJ & Producer", price:"$5,000+", rating:4.9, reviews:128, image:"https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&h=400&fit=crop&crop=face", genre:"music", verified:true },
@@ -1419,21 +1651,6 @@ function switchAuthTab(tab) {
   event.target.classList.add('active');
   document.getElementById(tab + 'Form').classList.add('active');
 }
-function handleSignIn() {
-  isLoggedIn = true;
-  closeAuthModal();
-  document.querySelector('.btn-primary.btn-sm').classList.add('hidden');
-  document.getElementById('userMenuDropdown').classList.remove('hidden');
-  showToast('Welcome back, John!', 'success');
-}
-function handleSignUp() {
-  isLoggedIn = true;
-  closeAuthModal();
-  document.querySelector('.btn-primary.btn-sm').classList.add('hidden');
-  document.getElementById('userMenuDropdown').classList.remove('hidden');
-  showToast('Account created successfully!', 'success');
-}
-
 // ==================== TOAST ====================
 function showToast(message, type='info') {
   const container = document.getElementById('toastContainer');
@@ -1491,17 +1708,11 @@ function goToPayment() {
   navigateTo('payment');
 }
 
-function handleSignOut() {
-  isLoggedIn = false;
-  document.getElementById('userMenuDropdown').classList.add('hidden');
-  document.querySelector('.btn-primary.btn-sm').classList.remove('hidden');
-  showToast('Signed out successfully', 'info');
-  navigateTo('home');
-}
-
 // ==================== INIT ====================
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  await checkAuth();
+  await Promise.all([loadArtistsFromAPI(), loadEventsFromAPI()]);
   // Load saved preferences
   const savedTheme = localStorage.getItem('sp-theme') || 'system';
   setTheme(savedTheme);
